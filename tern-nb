@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Read, edit and run cells of notebooks open in Tern, in their live kernels.
+
+Talks to the `nbbridge` Tern window plugin (see window.luau beside this file).
+"""
+
+import argparse
+import base64
+import errno
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import uuid
+
+DATA = os.path.join(
+    os.environ.get("TERN_CONFIG_DIR") or os.path.expanduser("~/Library/Application Support/Tern"),
+    "plugin-data",
+    "nbbridge",
+)
+REQ = os.path.join(DATA, "req")
+RES = os.path.join(DATA, "res")
+BELL = os.path.join(DATA, "doorbell")
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+IMAGE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/svg+xml": "svg"}
+
+
+class BridgeError(Exception):
+    pass
+
+
+def ring(deadline):
+    """Wakes the window; a FIFO with no reader means no window is listening yet."""
+    while True:
+        try:
+            fd = os.open(BELL, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as e:
+            if e.errno not in (errno.ENXIO, errno.ENOENT) or time.monotonic() > deadline:
+                raise BridgeError(
+                    "the nbbridge Tern plugin isn't listening: is Tern open, and does "
+                    "`tern plugin list` show nbbridge ready?"
+                ) from e
+            time.sleep(0.05)
+            continue
+        try:
+            os.write(fd, b"\n")
+        finally:
+            os.close(fd)
+        return
+
+
+def call(op, timeout, **fields):
+    os.makedirs(REQ, exist_ok=True)
+    rid = uuid.uuid4().hex
+    req = {"op": op, **{k: v for k, v in fields.items() if v is not None}}
+    tmp = os.path.join(REQ, f".{rid}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(req, f)
+    os.replace(tmp, os.path.join(REQ, f"{rid}.json"))
+
+    ack = os.path.join(RES, f"{rid}.ack")
+    res = os.path.join(RES, f"{rid}.json")
+    start = time.monotonic()
+    ring(start + 5)
+    # A reader left over from a plugin reload can swallow one ring; ring again until acked.
+    last_ring = time.monotonic()
+    try:
+        while not os.path.exists(res):
+            now = time.monotonic()
+            if not os.path.exists(ack):
+                if now - start > 10:
+                    raise BridgeError("Tern never picked up the request")
+                if now - last_ring > 1:
+                    ring(now + 5)
+                    last_ring = now
+            elif timeout and now - start > timeout:
+                raise BridgeError(f"no answer within {timeout}s (the cell may still be running)")
+            time.sleep(0.03)
+        with open(res) as f:
+            body = json.load(f)
+    finally:
+        for path in (ack, res, os.path.join(REQ, f"{rid}.json")):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+    if not body.get("ok"):
+        raise BridgeError(body.get("error") or "the plugin reported a failure")
+    return body.get("result")
+
+
+def nb_ref(value):
+    if value is None:
+        return None
+    if value.isdigit():
+        return int(value)
+    return os.path.realpath(os.path.expanduser(value))
+
+
+def source_arg(value):
+    if value is None or value == "-":
+        return sys.stdin.read()
+    return value
+
+
+def join_text(value):
+    return "".join(value) if isinstance(value, list) else str(value)
+
+
+def render_output(out, cell_id, n, image_dir):
+    kind = out.get("type")
+    if kind == "stream":
+        text = out.get("text", "")
+        return text if out.get("name") != "stderr" else "".join(f"[stderr] {l}\n" for l in text.splitlines())
+    if kind == "error":
+        tb = "\n".join(ANSI.sub("", line) for line in out.get("traceback") or [])
+        return (tb or f"{out.get('ename')}: {out.get('evalue')}") + "\n"
+    data = out.get("data") or {}
+    lines = []
+    prefix = f"Out[{out['count']}]: " if kind == "execute_result" and out.get("count") is not None else ""
+    for mime, ext in IMAGE_EXT.items():
+        if mime in data:
+            os.makedirs(image_dir, exist_ok=True)
+            path = os.path.join(image_dir, f"cell{cell_id}-{n}.{ext}")
+            payload = join_text(data[mime])
+            with open(path, "wb") as f:
+                f.write(payload.encode() if mime == "image/svg+xml" else base64.b64decode(payload))
+            lines.append(f"{prefix}[{mime} saved to {path}]")
+            break
+    else:
+        if "text/plain" in data:
+            lines.append(prefix + join_text(data["text/plain"]))
+        elif "text/markdown" in data:
+            lines.append(prefix + join_text(data["text/markdown"]))
+        elif data:
+            lines.append(prefix + f"[{', '.join(sorted(data))}]")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def has_error(cell):
+    return any(o.get("type") == "error" for o in cell.get("outputs") or [])
+
+
+def print_cell(cell, image_dir, source=True, outputs=True):
+    count = f" In[{cell['count']}]" if cell.get("count") is not None else ""
+    print(f"── cell {cell['id']} · {cell['kind']}{count} · {cell['state']}")
+    if source and cell.get("source"):
+        print(cell["source"].rstrip("\n"))
+    if outputs and cell.get("outputs"):
+        if source:
+            print("── output")
+        for n, out in enumerate(cell["outputs"]):
+            sys.stdout.write(render_output(out, cell["id"], n, image_dir))
+
+
+
+def act(nb, timeout, actions, cell=None):
+    """Dispatches notebook view actions, after selecting `cell` when given."""
+    return call("act", timeout, nb=nb, cell=cell, actions=actions)
+
+
+def ids(result):
+    return [c["id"] for c in result["cells"]]
+
+
+def view_action(args, nb, timeout):
+    """Edits the notebook API lacks, done through the notebook block's own key actions and
+    checked against the cells that come back."""
+    cmd = args.cmd
+    if cmd == "delete":
+        for cell in args.cells:
+            # A double-press action, like Jupyter's `d d`.
+            result = act(nb, timeout, ["notebook.twice.delete"] * 2, cell=cell)
+            if cell in ids(result):
+                raise BridgeError(f"cell {cell} is still there after deleting it")
+        print(f"deleted {' '.join(map(str, args.cells))}")
+    elif cmd == "move":
+        before = ids(call("cells", timeout, nb=nb))
+        result = act(nb, timeout, [f"notebook.move_{args.direction}"] * args.by, cell=args.cell)
+        after = ids(result)
+        if after.index(args.cell) == before.index(args.cell):
+            raise BridgeError(f"cell {args.cell} did not move")
+        print(f"cell {args.cell} is now at position {after.index(args.cell) + 1} of {len(after)}")
+    elif cmd == "kind":
+        result = act(nb, timeout, [f"notebook.to_{args.to}"], cell=args.cell)
+        kinds = {c["id"]: c["kind"] for c in result["cells"]}
+        if kinds.get(args.cell) != args.to:
+            raise BridgeError(f"cell {args.cell} is {kinds.get(args.cell)}, not {args.to}")
+        print(f"cell {args.cell} is {args.to}")
+    elif cmd == "save":
+        result = act(nb, timeout, ["notebook.save"])
+        if result.get("dirty"):
+            raise BridgeError("the notebook still has unsaved changes")
+        print("saved")
+    elif cmd == "interrupt":
+        act(nb, timeout, ["notebook.twice.interrupt"] * 2)
+        print(json.dumps(call("kernel", timeout, nb=nb), indent=2))
+    else:
+        act(nb, timeout, [f"notebook.{cmd}"])
+        print(cmd)
+    return 0
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="tern-nb",
+        description="Read, edit and run cells of notebooks open in Tern, in their live kernels.",
+    )
+    p.add_argument("--nb", help="notebook block: pane id or .ipynb path (default: the only open notebook)")
+    p.add_argument("--json", action="store_true", help="print the plugin's JSON answer")
+    p.add_argument("--timeout", type=float, default=0, help="seconds to wait for a run (default: no limit)")
+    p.add_argument("--images", default=os.path.join(tempfile.gettempdir(), "tern-nb"), help="where image outputs are saved")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="open notebook blocks and their kernels")
+    o = sub.add_parser("open", help="open an .ipynb in a notebook block beside the focused pane")
+    o.add_argument("path")
+    c = sub.add_parser("cells", help="cells with sources and outputs")
+    c.add_argument("--no-outputs", action="store_true")
+    c.add_argument("--no-source", action="store_true")
+    e = sub.add_parser("exec", help="append a code cell, run it in the notebook's kernel, print its outputs")
+    e.add_argument("source", nargs="?", help="code, or - / omitted for stdin")
+    e.add_argument("--after", type=int, help="insert after this cell id (0: first) instead of appending")
+    r = sub.add_parser("run", help="run one cell, or all cells")
+    g = r.add_mutually_exclusive_group(required=True)
+    g.add_argument("cell", nargs="?", type=int)
+    g.add_argument("--all", action="store_true")
+    a = sub.add_parser("add", help="insert a cell without running it")
+    a.add_argument("source", nargs="?", help="source, or - / omitted for stdin")
+    a.add_argument("--kind", choices=["code", "markdown", "raw"], default="code")
+    a.add_argument("--after", type=int, help="insert after this cell id (0: first; default: append)")
+    ed = sub.add_parser("edit", help="replace a cell's source (keeps its outputs)")
+    ed.add_argument("cell", type=int)
+    ed.add_argument("source", nargs="?", help="source, or - / omitted for stdin")
+    sub.add_parser("kernel", help="kernel status")
+    sub.add_parser("restart", help="restart the kernel (no confirmation)")
+    d = sub.add_parser("delete", help="delete cells (undoable with `undo`)")
+    d.add_argument("cells", nargs="+", type=int)
+    m = sub.add_parser("move", help="move a cell up or down")
+    m.add_argument("cell", type=int)
+    m.add_argument("direction", choices=["up", "down"])
+    m.add_argument("--by", type=int, default=1, help="positions to move (default 1)")
+    k = sub.add_parser("kind", help="change a cell to code, markdown or raw")
+    k.add_argument("cell", type=int)
+    k.add_argument("to", choices=["code", "markdown", "raw"])
+    sub.add_parser("save", help="save the notebook to its .ipynb")
+    sub.add_parser("interrupt", help="interrupt the running cell")
+    sub.add_parser("undo", help="undo the last cell edit")
+    sub.add_parser("redo", help="redo the last undone cell edit")
+    args = p.parse_args()
+
+    nb = nb_ref(args.nb)
+    t = args.timeout or None
+    cmd = args.cmd
+    if cmd == "list":
+        result = call("list", t)
+    elif cmd == "open":
+        result = call("open", t, path=os.path.realpath(os.path.expanduser(args.path)))
+    elif cmd == "cells":
+        result = call("cells", t, nb=nb)
+    elif cmd == "exec":
+        result = call("exec", t, nb=nb, source=source_arg(args.source), after=args.after)
+    elif cmd == "run":
+        result = call("run", t, nb=nb, cell=args.cell, all=args.all or None)
+    elif cmd == "add":
+        result = call("add", t, nb=nb, kind=args.kind, source=source_arg(args.source), after=args.after)
+    elif cmd == "edit":
+        result = call("edit", t, nb=nb, cell=args.cell, source=source_arg(args.source))
+    elif cmd == "kernel":
+        result = call("kernel", t, nb=nb)
+    elif cmd == "restart":
+        result = call("restart", t, nb=nb)
+    else:
+        return view_action(args, nb, t)
+
+    if args.json:
+        json.dump(result, sys.stdout, indent=2)
+        print()
+        return 1 if cmd in ("exec", "run") and any(has_error(c) for c in result["cells"]) else 0
+
+    if cmd == "list":
+        if not result:
+            print("no notebooks open")
+        for n in result:
+            k = n["kernel"]
+            mark = "*" if n["focused"] else " "
+            print(f"{mark} {n['pane']}  {n['path'] or n['title']}  kernel: {k.get('status')} {k.get('label') or ''}".rstrip())
+    elif cmd == "open":
+        print(f"{result['pane']}{'' if result['opened'] else ' (already open)'}")
+    elif cmd == "cells":
+        for cell in result["cells"]:
+            print_cell(cell, args.images, source=not args.no_source, outputs=not args.no_outputs)
+    elif cmd in ("exec", "run"):
+        for cell in result["cells"]:
+            print_cell(cell, args.images, source=cmd == "run")
+        return 1 if any(has_error(c) for c in result["cells"]) else 0
+    elif cmd in ("add", "edit"):
+        print(result["cell"])
+    else:
+        print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BridgeError as e:
+        print(f"tern-nb: {e}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)

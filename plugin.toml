@@ -1,0 +1,7 @@
+schema = 1
+id = "nbbridge"
+name = "Notebook bridge"
+version = "0.1.0"
+description = "Lets agents read, edit and run Tern notebook cells through the tern-nb command."
+icon = "terminal"
+window = "window.luau"
