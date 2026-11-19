@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import tempfile
 import time
 import uuid
@@ -24,6 +25,23 @@ REQ = os.path.join(DATA, "req")
 RES = os.path.join(DATA, "res")
 BELL = os.path.join(DATA, "doorbell")
 
+# Tern gives each window-plugin handler 50 ms and disables that kind of
+# handler (process, timer) until a reload when one runs longer, even when the
+# time went to Tern itself (a notebook opening, a busy window). With its
+# process handler off, the doorbell loses its reader; with its timer handler
+# off, requests are never picked up or never answered. Either way the plugin
+# is reloaded and the request retried when that is safe.
+DEAF_AFTER = 2.0
+# The plugin picks a request up within milliseconds and answers everything
+# but a run at once; longer than these and its handlers are off.
+ACK_WITHIN = 3.0
+ANSWER_WITHIN = 5.0
+# Requests that may run as long as a cell: the plugin is pinged meanwhile.
+LONG = {"exec", "run", "restart"}
+PING_EVERY = 5.0
+# Requests that change nothing, so a retry after a reload cannot apply twice.
+IDEMPOTENT = {"list", "open", "cells", "kernel", "ping"}
+
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 IMAGE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/svg+xml": "svg"}
 
@@ -32,30 +50,68 @@ class BridgeError(Exception):
     pass
 
 
+class Disabled(Exception):
+    def __init__(self, acked):
+        super().__init__("nbbridge stopped answering")
+        self.acked = acked
+
+
+def try_ring():
+    """Rings the doorbell once; False when nothing reads it."""
+    try:
+        fd = os.open(BELL, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno in (errno.ENXIO, errno.ENOENT):
+            return False
+        raise
+    try:
+        os.write(fd, b"\n")
+    finally:
+        os.close(fd)
+    return True
+
+
 def ring(deadline):
-    """Wakes the window; a FIFO with no reader means no window is listening yet."""
-    while True:
-        try:
-            fd = os.open(BELL, os.O_WRONLY | os.O_NONBLOCK)
-        except OSError as e:
-            if e.errno not in (errno.ENXIO, errno.ENOENT) or time.monotonic() > deadline:
-                raise BridgeError(
-                    "the nbbridge Tern plugin isn't listening: is Tern open, and does "
-                    "`tern plugin list` show nbbridge ready?"
-                ) from e
-            time.sleep(0.05)
-            continue
-        try:
-            os.write(fd, b"\n")
-        finally:
-            os.close(fd)
-        return
+    while not try_ring():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def reload_plugin():
+    print(
+        "tern-nb: Tern disabled nbbridge (a handler overran Tern's 50 ms budget); reloading it",
+        file=sys.stderr,
+    )
+    try:
+        subprocess.run(["tern", "plugin", "reload"], capture_output=True, timeout=30)
+    except FileNotFoundError as e:
+        raise BridgeError("the `tern` command is not on PATH, so nbbridge cannot be reloaded") from e
+    if not ring(time.monotonic() + 10):
+        raise BridgeError(
+            "the nbbridge Tern plugin isn't listening: is Tern open, and does "
+            "`tern plugin list` show nbbridge ready?"
+        )
 
 
 def call(op, timeout, **fields):
+    req = {"op": op, **{k: v for k, v in fields.items() if v is not None}}
+    try:
+        return request(req, timeout)
+    except Disabled as disabled:
+        reload_plugin()
+        if disabled.acked and op not in IDEMPOTENT:
+            raise BridgeError(
+                f"Tern disabled nbbridge while it handled `{op}`, and it is reloaded; "
+                "the change may or may not have been made: check with `tern-nb cells`"
+            ) from disabled
+        return request(req, timeout)
+
+
+def request(req, timeout):
     os.makedirs(REQ, exist_ok=True)
     rid = uuid.uuid4().hex
-    req = {"op": op, **{k: v for k, v in fields.items() if v is not None}}
     tmp = os.path.join(REQ, f".{rid}.tmp")
     with open(tmp, "w") as f:
         json.dump(req, f)
@@ -64,20 +120,40 @@ def call(op, timeout, **fields):
     ack = os.path.join(RES, f"{rid}.ack")
     res = os.path.join(RES, f"{rid}.json")
     start = time.monotonic()
-    ring(start + 5)
-    # A reader left over from a plugin reload can swallow one ring; ring again until acked.
-    last_ring = time.monotonic()
     try:
+        if not ring(start + DEAF_AFTER):
+            raise Disabled(acked=False)
+        # Ringing every second covers a doorbell swallowed by a reader left
+        # over from a reload, and checks the plugin still re-arms its reader.
+        last_ring = last_ping = start
+        deaf_since = acked_at = None
         while not os.path.exists(res):
             now = time.monotonic()
-            if not os.path.exists(ack):
-                if now - start > 10:
-                    raise BridgeError("Tern never picked up the request")
-                if now - last_ring > 1:
-                    ring(now + 5)
-                    last_ring = now
-            elif timeout and now - start > timeout:
-                raise BridgeError(f"no answer within {timeout}s (the cell may still be running)")
+            if acked_at is None and os.path.exists(ack):
+                acked_at = now
+            if now - last_ring > 1:
+                last_ring = now
+                if try_ring():
+                    deaf_since = None
+                elif deaf_since is None:
+                    deaf_since = now
+                elif now - deaf_since >= DEAF_AFTER:
+                    raise Disabled(acked_at is not None)
+            if acked_at is None:
+                if now - start > ACK_WITHIN:
+                    raise Disabled(acked=False)
+            elif req["op"] not in LONG:
+                if now - acked_at > ANSWER_WITHIN:
+                    raise Disabled(acked=True)
+            else:
+                if timeout and now - start > timeout:
+                    raise BridgeError(f"no answer within {timeout}s (the cell may still be running)")
+                if now - last_ping > PING_EVERY:
+                    last_ping = now
+                    try:
+                        request({"op": "ping"}, None)
+                    except Disabled as disabled:
+                        raise Disabled(acked=True) from disabled
             time.sleep(0.03)
         with open(res) as f:
             body = json.load(f)

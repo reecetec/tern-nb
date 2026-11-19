@@ -184,6 +184,8 @@ local function handle(cx: WindowCx, id: string, req: { [string]: any })
 	local op = req.op
 	if op == "list" then
 		return answer(id, true, notebooks(cx))
+	elseif op == "ping" then
+		return answer(id, true, "pong")
 	elseif op == "act" then
 		return act(cx, id, resolve(cx, req.nb), req)
 	elseif op == "open" then
@@ -240,7 +242,15 @@ local function handle(cx: WindowCx, id: string, req: { [string]: any })
 	end
 end
 
-local function drain(cx: WindowCx)
+-- Tern gives each handler 50 ms and disables the plugin until a reload when
+-- one runs longer, counting time spent in Tern's own calls (opening a notebook
+-- can take most of it). So a request is handled in a timer tick of its own,
+-- never in the doorbell's callback, and one request per tick: a burst of them
+-- never shares a budget. The CLI reloads the plugin when it is disabled anyway.
+local function drain(cx: WindowCx?)
+	if not cx then
+		return
+	end
 	local ok, names = pcall(tern.fs.list, REQ)
 	if not ok then
 		tern.log.warn("nbbridge: cannot list requests", names)
@@ -264,6 +274,9 @@ local function drain(cx: WindowCx)
 					end
 				end
 			end
+			-- The rest in later ticks.
+			tern.timer(0, drain)
+			return
 		end
 	end
 end
@@ -277,7 +290,7 @@ local function listen()
 		function(result, cx)
 			listen()
 			if cx and result.status == 0 then
-				drain(cx)
+				tern.timer(0, drain)
 			end
 		end
 	)
@@ -297,7 +310,5 @@ tern.process.run({
 	end
 	listen()
 	-- Requests written while no window listened.
-	if cx then
-		drain(cx)
-	end
+	tern.timer(0, drain)
 end)

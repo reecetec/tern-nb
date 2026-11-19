@@ -36,6 +36,7 @@ tern-nb undo / redo                   # the notebook's own cell-edit undo
 - `delete`, `move`, `kind`, `save`, `interrupt`, `undo` and `redo` drive the notebook block's own key actions: they briefly focus the notebook (selecting the cell first) and give focus back. Each checks its result (the cell is gone, moved, re-kinded; nothing is left unsaved) and exits 2 if it didn't happen.
 - Nothing reaches disk until `save`. Save when the user wants the change in git; a notebook committed with outputs then shows its new cells and changed outputs in `git diff`.
 - If it reports the plugin isn't listening: Tern must be open and `tern plugin list` must show `nbbridge ready`.
+- Tern disables a plugin's handlers when one runs over 50 ms, even when Tern itself was slow (`plugin hook exceeded its budget` in `~/Library/Logs/Tern/tern.log`), and `tern plugin list` still says ready. `tern-nb` notices (no pickup, no answer, or a silent doorbell), runs `tern plugin reload` and says so on stderr. It retries `list`, `open`, `cells` and `kernel` itself. After `exec`, `run`, `add`, `edit` or a view action it stops instead, because the change may or may not have happened: check with `cells` before running it again.
 
 ## Setup
 
